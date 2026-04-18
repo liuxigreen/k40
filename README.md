@@ -1,6 +1,6 @@
 # AgentHansa Bot
 
-Long-running, compliance-first AgentHansa automation for this Termux host.
+Long-running, compliance-first AgentHansa automation for Termux, Linux, and macOS.
 
 ## Technical route
 
@@ -21,7 +21,7 @@ Why:
 ## Local assumptions
 
 - Python 3.11+
-- Termux / Linux
+- macOS, Linux, or Termux
 - Supply your own API key and local config on your machine
 - Recommended auth source: local env or secrets file outside the repository
 - Optional fallback: your own local `~/.config/agenthansa/agent.json`
@@ -30,12 +30,34 @@ Why:
 
 ```bash
 cd ~/agenthansa_bot
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 # copy config.example.yaml to config.yaml and fill in your values
 # keep live auth outside the repository when possible
 ```
 
-If you prefer isolation, a virtualenv also works, but this Termux host currently runs the bot with the system Python.
+Using a virtualenv is recommended on macOS and Linux. Termux can also run it with the system Python if you prefer.
+
+## macOS quick start
+
+```bash
+git clone https://github.com/liuxigreen/k40.git ~/agenthansa_bot
+cd ~/agenthansa_bot
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp config.example.yaml config.yaml
+# edit config.yaml and fill in your own values
+python -m pytest -q
+python main.py --once --dry-run
+```
+
+Notes for macOS:
+- The project uses only Python plus `httpx` and `PyYAML`.
+- The local web panel and service-control helpers use common shell tools available on macOS (`bash`, `ps`, `pkill`, `nohup`).
+- Runtime data defaults to `~/.agenthansa_bot/`, which works fine on macOS.
 
 ## Run once
 
@@ -87,7 +109,7 @@ Behavior:
 
 ```bash
 cd ~/agenthansa_bot
-python3 -m py_compile $(find . -name '*.py' -print)
+python -m py_compile $(find . -name '*.py' -print)
 python -m pytest test_redpacket_upgrade.py test_redpacket_watch.py -q
 python main.py --once --dry-run
 ```
@@ -150,7 +172,6 @@ By default under `~/.agenthansa_bot/`:
 2026-04-16 20:10:05 | INFO | tasks.my_submissions | submissions_refresh mode=fallback_journey count=10 risks=2
 ```
 
-
 ## Repo hygiene
 
 This public repo excludes live secrets, local state, logs, and private config.
@@ -162,3 +183,9 @@ Not included:
 - any live API tokens, chat IDs, cookies, or SSH keys
 
 Use `config.example.yaml` as the starting point for your own local config.
+
+## Recommended for this repo: code first, skill second
+
+This repository is best used as the **codebase** for running the bot on your own machine, including a Mac.
+
+If you later want reusable operator docs or packaging guidance, add those as markdown documentation or a separate skill-style knowledge repo. But the primary artifact here should remain the runnable script/code project.
