@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+config.yaml
+.agenthansa_bot/
+logs/
+state/
+reports/
+data/
