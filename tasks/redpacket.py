@@ -172,14 +172,7 @@ def _load_deepseek_config() -> dict[str, Any] | None:
     return {'url': url_match.group(1), 'keys': [str(k) for k in keys if str(k).strip()], 'model': 'DeepSeek-V3.2'}
 
 
-def _solve_question_llm(question: str) -> dict[str, Any] | None:
-    """Redpacket-only fallback solver.
-
-    DeepSeek use in this module is intentionally restricted to:
-    1. forum-comment prerequisite generation
-    2. forum-post prerequisite generation
-    3. question-solving fallback only when local rules fail
-    """
+def _solve_question_with_deepseek(question: str) -> dict[str, Any] | None:
     cfg = _load_deepseek_config()
     if not cfg:
         return None
@@ -190,7 +183,6 @@ def _solve_question_llm(question: str) -> dict[str, Any] | None:
     )
     for idx, key in enumerate(cfg['keys']):
         try:
-            import httpx
             with httpx.Client(timeout=18, headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json', 'Accept': 'application/json'}) as client:
                 resp = client.post(cfg['url'], json={
                     'model': cfg['model'],
@@ -209,6 +201,65 @@ def _solve_question_llm(question: str) -> dict[str, Any] | None:
                     return {'answer': match[-1], 'provider': 'deepseek-local', 'key_index': idx}
         except Exception:
             continue
+    return None
+
+
+def _solve_question_with_haiku(question: str) -> dict[str, Any] | None:
+    api_key = ''
+    for env_name in ('ANTHROPIC_API_KEY', 'ANTHROPIC_TOKEN'):
+        api_key = str(__import__('os').getenv(env_name) or '').strip()
+        if api_key:
+            break
+    if not api_key:
+        return None
+    prompt = (
+        'Solve this red packet comprehension question. '
+        'Return only one integer with no explanation.\n\n'
+        f'Question: {question}'
+    )
+    try:
+        with httpx.Client(
+            timeout=18,
+            headers={
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+        ) as client:
+            resp = client.post(
+                'https://api.anthropic.com/v1/messages',
+                json={
+                    'model': 'claude-3-5-haiku-latest',
+                    'max_tokens': 16,
+                    'temperature': 0,
+                    'system': 'Return only the integer answer.',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get('content') or []
+            texts = [part.get('text', '') for part in content if isinstance(part, dict)]
+            match = re.findall(r'-?\d+', ' '.join(texts).strip())
+            if match:
+                return {'answer': match[-1], 'provider': 'haiku-fallback'}
+    except Exception:
+        return None
+    return None
+
+
+def _solve_question_llm(question: str, *, allow_haiku: bool = True) -> dict[str, Any] | None:
+    """Redpacket-only fallback solver.
+
+    Order:
+    1. DeepSeek
+    2. Haiku fallback when explicitly allowed
+    """
+    deepseek = _solve_question_with_deepseek(question)
+    if deepseek:
+        return deepseek
+    if allow_haiku:
+        return _solve_question_with_haiku(question)
     return None
 
 
@@ -440,6 +491,16 @@ def _http_error_details(exc: httpx.HTTPStatusError) -> dict[str, Any]:
     }
 
 
+def _is_wrong_answer_error(exc: httpx.HTTPStatusError) -> bool:
+    details = _http_error_details(exc)
+    body = str(details.get('body') or '').lower()
+    return details.get('status_code') == 400 and ('wrong answer' in body or 'request a new challenge' in body)
+
+
+def _attempt_join_with_answer(client: AgentHansaClient, packet_id: str, answer: str) -> dict[str, Any]:
+    return client.post(f'/red-packets/{packet_id}/join', json={'answer': answer})
+
+
 def run(client: AgentHansaClient, store: JsonStateStore, dry_run: bool = False) -> dict[str, Any]:
     log = logging.getLogger('tasks.redpacket')
     packet_state = store.load('redpacket_state', default={})
@@ -528,15 +589,43 @@ def run(client: AgentHansaClient, store: JsonStateStore, dry_run: bool = False) 
         return result
 
     try:
-        joined = client.post(f'/red-packets/{packet_id}/join', json={'answer': answer})
+        joined = _attempt_join_with_answer(client, packet_id, answer)
     except httpx.HTTPStatusError as exc:
-        result['status'] = 'manual_required'
-        result['reason'] = 'join_request_rejected'
-        result['join_error'] = _http_error_details(exc)
-        store.save('redpacket_state', {**packet_state, **result})
-        log.warning('red packet join rejected packet_id=%s solver=%s status_code=%s body=%s', packet_id, solver, result['join_error'].get('status_code'), result['join_error'].get('body'))
-        _notify_result(store, result)
-        return result
+        if solver == 'local_rules' and _is_wrong_answer_error(exc):
+            retry_challenge = client.get(f'/red-packets/{packet_id}/challenge')
+            retry_question = retry_challenge.get('question', '')
+            retry_llm = _solve_question_llm(retry_question, allow_haiku=True)
+            if retry_llm:
+                retry_answer = retry_llm['answer']
+                result['initial_solver'] = solver
+                result['initial_answer_preview'] = answer
+                result['retry_join_attempted'] = True
+                result['retry_reason'] = 'wrong_answer'
+                result['challenge'] = retry_challenge
+                result['answer_preview'] = retry_answer
+                result['solver'] = retry_llm['provider']
+                result['llm_solver'] = retry_llm
+                try:
+                    joined = _attempt_join_with_answer(client, packet_id, retry_answer)
+                except httpx.HTTPStatusError as retry_exc:
+                    result['status'] = 'manual_required'
+                    result['reason'] = 'join_request_rejected'
+                    result['join_error'] = _http_error_details(retry_exc)
+                    store.save('redpacket_state', {**packet_state, **result})
+                    log.warning('red packet join rejected after llm retry packet_id=%s solver=%s status_code=%s body=%s', packet_id, result['solver'], result['join_error'].get('status_code'), result['join_error'].get('body'))
+                    _notify_result(store, result)
+                    return result
+            else:
+                result['retry_join_attempted'] = True
+                result['retry_reason'] = 'wrong_answer'
+        if 'joined' not in locals():
+            result['status'] = 'manual_required'
+            result['reason'] = 'join_request_rejected'
+            result['join_error'] = _http_error_details(exc)
+            store.save('redpacket_state', {**packet_state, **result})
+            log.warning('red packet join rejected packet_id=%s solver=%s status_code=%s body=%s', packet_id, solver, result['join_error'].get('status_code'), result['join_error'].get('body'))
+            _notify_result(store, result)
+            return result
 
     packet_state['last_joined_packet_id'] = packet_id
     packet_state['last_joined_at'] = utc_now().isoformat()

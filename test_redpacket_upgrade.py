@@ -14,12 +14,14 @@ class _NotifyStub:
 
 
 class _DummyClient:
-    def __init__(self, overview, challenge=None, join_response=None, join_error=None, post_failures=None):
+    def __init__(self, overview, challenge=None, join_response=None, join_error=None, post_failures=None, challenge_sequence=None, post_sequences=None):
         self.overview = overview
         self.challenge = challenge or {'question': 'What is the sum of four and 4 keys?'}
+        self.challenge_sequence = list(challenge_sequence or [])
         self.join_response = join_response or {'ok': True}
         self.join_error = join_error
         self.post_failures = post_failures or {}
+        self.post_sequences = {key: list(value) for key, value in (post_sequences or {}).items()}
         self.calls = []
         self.posts = []
 
@@ -28,11 +30,19 @@ class _DummyClient:
         if path == '/red-packets':
             return self.overview
         if path.startswith('/red-packets/') and path.endswith('/challenge'):
+            if self.challenge_sequence:
+                return self.challenge_sequence.pop(0)
             return self.challenge
         raise AssertionError(f'unexpected path: {path}')
 
     def post(self, path: str, json=None):
         self.posts.append((path, json))
+        sequence = self.post_sequences.get(path)
+        if sequence:
+            outcome = sequence.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         failure = self.post_failures.get(path)
         if failure is not None:
             raise failure
@@ -133,11 +143,73 @@ def test_run_notifies_after_successful_join(tmp_path, monkeypatch):
     assert notify.calls[0]['status'] == 'joined'
 
 
+def test_run_retries_wrong_answer_with_llm_fallback(tmp_path, monkeypatch):
+    notify = _NotifyStub()
+    monkeypatch.setattr('tasks.redpacket.maybe_notify_redpacket', notify)
+    monkeypatch.setattr('tasks.redpacket.load_settings', lambda: object())
+    monkeypatch.setattr('tasks.redpacket._complete_required_action', lambda client, packet, packet_state, dry_run: {'status': 'completed', 'action': 'noop'})
+    monkeypatch.setattr('tasks.redpacket._solve_question_local', lambda _question: '8')
+
+    llm_calls = []
+
+    def _llm(question: str, *, allow_haiku: bool = True):
+        llm_calls.append((question, allow_haiku))
+        return {'answer': '9', 'provider': 'deepseek-local', 'key_index': 0}
+
+    monkeypatch.setattr('tasks.redpacket._solve_question_llm', _llm)
+
+    request = httpx.Request('POST', 'https://www.agenthansa.com/api/red-packets/packet-2/join')
+    wrong_answer = httpx.HTTPStatusError(
+        'join failed',
+        request=request,
+        response=httpx.Response(400, request=request, text='{"detail":"Wrong answer. Try again or request a new challenge."}'),
+    )
+
+    store = JsonStateStore(tmp_path)
+    client = _DummyClient(
+        {
+            'active': [{'id': 'packet-2', 'title': 'Problem Packet', 'challenge_description': 'math puzzle'}],
+            'next_packet_at': '2026-04-16T21:27:33.335175+00:00',
+            'next_packet_seconds': 5817,
+        },
+        challenge_sequence=[
+            {'question': 'What is 4 + 4?'},
+            {'question': 'What is 4 + 5?'},
+        ],
+        post_sequences={
+            '/red-packets/packet-2/join': [wrong_answer, {'ok': True, 'joined': True}],
+        },
+    )
+
+    result = run(client, store, dry_run=False)
+    saved = store.load('redpacket_state')
+
+    assert result['status'] == 'joined'
+    assert result['joined'] is True
+    assert result['solver'] == 'deepseek-local'
+    assert result['llm_solver']['answer'] == '9'
+    assert result['initial_solver'] == 'local_rules'
+    assert result['initial_answer_preview'] == '8'
+    assert result['retry_join_attempted'] is True
+    assert result['retry_reason'] == 'wrong_answer'
+    assert llm_calls == [('What is 4 + 5?', True)]
+    assert client.posts == [
+        ('/red-packets/packet-2/join', {'answer': '8'}),
+        ('/red-packets/packet-2/join', {'answer': '9'}),
+    ]
+    assert saved['status'] == 'joined'
+    assert saved['solver'] == 'deepseek-local'
+    assert len(notify.calls) == 1
+    assert notify.calls[0]['status'] == 'joined'
+
+
 def test_run_handles_join_http_400_without_crashing(tmp_path, monkeypatch):
     notify = _NotifyStub()
     monkeypatch.setattr('tasks.redpacket.maybe_notify_redpacket', notify)
     monkeypatch.setattr('tasks.redpacket.load_settings', lambda: object())
     monkeypatch.setattr('tasks.redpacket._complete_required_action', lambda client, packet, packet_state, dry_run: {'status': 'completed', 'action': 'noop'})
+    monkeypatch.setattr('tasks.redpacket._solve_question_local', lambda _question: '8')
+    monkeypatch.setattr('tasks.redpacket._solve_question_llm', lambda _question, *, allow_haiku=True: None)
 
     request = httpx.Request('POST', 'https://www.agenthansa.com/api/red-packets/packet-2/join')
     response = httpx.Response(400, request=request, text='{"message":"already joined or invalid answer"}')
@@ -300,7 +372,25 @@ def test_dry_run_does_not_call_external_solver(monkeypatch, tmp_path):
 
 def test_external_solver_fallback_returns_none_without_config(monkeypatch):
     monkeypatch.setattr('tasks.redpacket._load_deepseek_config', lambda: None)
+    monkeypatch.setattr('tasks.redpacket._solve_question_with_haiku', lambda _question: None)
     assert _solve_question_llm('What is 1 + 1?') is None
+
+
+def test_external_solver_fallback_uses_haiku_after_deepseek_failure(monkeypatch):
+    monkeypatch.setattr('tasks.redpacket._solve_question_with_deepseek', lambda _question: None)
+    monkeypatch.setattr('tasks.redpacket._solve_question_with_haiku', lambda question: {'answer': '2', 'provider': 'haiku-fallback', 'question': question})
+
+    result = _solve_question_llm('What is 1 + 1?')
+
+    assert result['answer'] == '2'
+    assert result['provider'] == 'haiku-fallback'
+
+
+def test_external_solver_can_disable_haiku_fallback(monkeypatch):
+    monkeypatch.setattr('tasks.redpacket._solve_question_with_deepseek', lambda _question: None)
+    monkeypatch.setattr('tasks.redpacket._solve_question_with_haiku', lambda _question: (_ for _ in ()).throw(AssertionError('haiku should be disabled')))
+
+    assert _solve_question_llm('What is 1 + 1?', allow_haiku=False) is None
 
 
 def test_generate_forum_comment_body_uses_deepseek_when_available(monkeypatch):

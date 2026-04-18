@@ -33,7 +33,7 @@ SERVICE_DEFS = {
     'web_panel': {
         'label': '面板服务',
         'match': 'python web_panel.py',
-        'start': "nohup python web_panel.py --host 127.0.0.1 --port 8765 > ~/.agenthansa_bot/logs/web_panel.out 2>&1 &",
+        'start': "nohup python web_panel.py --host 192.168.31.191 --port 8765 > ~/.agenthansa_bot/logs/web_panel.out 2>&1 &",
         'stop': "pkill -f 'python web_panel.py' || true",
     },
 }
@@ -953,7 +953,7 @@ class PanelHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Mobile-friendly AgentHansa/Hermes web panel')
-    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--host', default='192.168.31.191')
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), PanelHandler)
